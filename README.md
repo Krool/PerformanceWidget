@@ -73,6 +73,7 @@ settings are kept. Only one widget runs per user; a second launch exits quietly.
 | Lock position | Stops dragging, so a stray click cannot move it. | Off |
 | Start with Windows | Adds or removes a shortcut in your Startup folder. | Off |
 | Reset position | Moves it back to the bottom-right corner of the main screen. | |
+| Reload plugins | Loads plugins again after you add or edit one. Shown when plugins exist. | |
 | About Performance Widget | Version, settings path and a link to this page. | |
 | Exit | Closes the widget. Start it again from the Start Menu. | |
 
@@ -108,8 +109,43 @@ file is ignored.
 | `Opacity` | 0.2 to 1.0 |
 | `TopMost` | `true` to stay on top |
 | `Locked` | `true` to stop dragging |
+| `Plugins` | Paths to plugin scripts kept outside the plugins folder; `%VARS%` are expanded |
 
 Delete the file to reset everything.
+
+## Plugins
+
+A plugin adds rows of its own under the built-in ones: a job queue, a build farm, a game
+server. It is a `.ps1` file in `%LOCALAPPDATA%\PerformanceWidget\plugins`, or one listed in
+the `Plugins` setting, that defines a function `Get-WidgetRows`. The widget calls it every
+five seconds and draws one row per hashtable it returns:
+
+```powershell
+# %LOCALAPPDATA%\PerformanceWidget\plugins\builds.ps1
+function Get-WidgetRows {
+    $running = @(Get-Process msbuild -ErrorAction SilentlyContinue)
+    @{ Key = 'builds'; Label = 'Builds'; Text = "$($running.Count) msbuild running"; Tip = 'MSBuild processes' }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `Key` | Required. Unique id; hides like a section and is saved in `Hidden` |
+| `Label` | Name in the right-click menu (defaults to `Key`) |
+| `Text` | Text after the icon |
+| `Note` | Short dim text at the right edge |
+| `Icon` | Path to an `.exe`, `.ico` or image; a plain square without one |
+| `Pips` | Array of slot states drawn as dots instead of `Text`: 0 free, 1 busy, 2 exclusive |
+| `PipTips` | Hover text per pip |
+| `Warn` | Red lines under the row |
+| `Tip`, `WarnTip` | Hover text for the row and its red lines |
+| `Mark`, `MarkTip` | 0 to 1: a blue tick on the whole-machine bar, with hover text |
+
+Return nothing to hide a row while it has nothing to show. Each plugin runs in its own
+module, so script-scope variables keep their values between calls. A plugin that fails to
+load or throws keeps its last rows and adds a red error row naming it; hover for the
+message. Plugins run with your permissions, like any script you run, so only add ones you
+trust.
 
 ## Uninstall
 
@@ -137,7 +173,7 @@ powershell -ExecutionPolicy Bypass -File .\test.ps1
 Each case runs the real script in `-Snapshot` mode (draws the window off screen, saves a
 PNG, prints its state and hover text, exits) with a private settings folder, so it never
 touches your settings or a running widget. It covers defaults, every section, injected
-read failures, the compact view and malformed settings. About a minute.
+read failures, the compact view, plugins and malformed settings. About a minute.
 
 The screenshots above come from the same mode:
 

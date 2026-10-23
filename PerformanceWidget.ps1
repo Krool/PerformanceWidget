@@ -15,6 +15,10 @@
   the compact view. Hover any bar or row for what it means. Right-click for every option.
   Position and options persist in %LOCALAPPDATA%\PerformanceWidget\settings.json.
 
+  Plugins add rows of their own (a job queue, a build farm, a game server): any .ps1 in
+  %LOCALAPPDATA%\PerformanceWidget\plugins, or listed in the Plugins setting, that defines
+  Get-WidgetRows. They refresh every five seconds. See the README.
+
 .PARAMETER Snapshot
   Build the window off screen, sample for a few seconds, save a PNG to this path and
   exit. Used by the tests and for the README screenshot; no window is left open.
@@ -32,7 +36,7 @@ param(
     [string]$Fail = ''   # with -Snapshot: "core0,ram"; one string, since -File does not split arrays
 )
 
-$Version = '1.0.0'
+$Version = '1.1.0'
 $RepoUrl = 'https://github.com/Krool/PerformanceWidget'
 $AppName = 'Performance Widget'
 
@@ -71,7 +75,7 @@ if (-not $Snapshot) {
 
 $Cfg = @{
     X = $null; Y = $null; Opacity = 0.9; TopMost = $true; Smoothing = 'Smooth'
-    Hidden = @('disk', 'net'); Interval = 1000; Compact = $false; Locked = $false
+    Hidden = @('disk', 'net'); Interval = 1000; Compact = $false; Locked = $false; Plugins = @()
 }
 try {
     if (Test-Path -LiteralPath $settingsPath) {
@@ -84,6 +88,7 @@ try {
     }
 } catch { }
 $Cfg.Hidden = @($Cfg.Hidden | Where-Object { $_ } | ForEach-Object { [string]$_ })
+$Cfg.Plugins = @($Cfg.Plugins | Where-Object { $_ } | ForEach-Object { [string]$_ })
 # Hand edits: opacity must be a number the window can still be clicked at; "false" is false.
 $op = $Cfg.Opacity -as [double]
 $Cfg.Opacity = if ($null -eq $op) { 0.9 } else { [math]::Min(1.0, [math]::Max(0.2, $op)) }
@@ -106,8 +111,9 @@ function Save-Settings {
     try {
         if (-not (Test-Path -LiteralPath $settingsDir)) { New-Item -ItemType Directory -Force -Path $settingsDir | Out-Null }
         $o = [ordered]@{}
-        foreach ($k in @('X', 'Y', 'Opacity', 'TopMost', 'Smoothing', 'Hidden', 'Interval', 'Compact', 'Locked')) { $o[$k] = $Cfg[$k] }
+        foreach ($k in @('X', 'Y', 'Opacity', 'TopMost', 'Smoothing', 'Hidden', 'Interval', 'Compact', 'Locked', 'Plugins')) { $o[$k] = $Cfg[$k] }
         $o.Hidden = @($Cfg.Hidden)
+        $o.Plugins = @($Cfg.Plugins)
         ([pscustomobject]$o | ConvertTo-Json) | Set-Content -LiteralPath $settingsPath -Encoding UTF8
     } catch { }
 }
@@ -154,6 +160,14 @@ using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace PerformanceWidget {
+// One row supplied by a plugin. Pips, when set, draw a dot per slot: 0 free, 1 held, 2 exclusive.
+public class ExtRow {
+    public string Key = "", Text = "", Note = "", Tip = "", WarnTip = "";
+    public string[] Warn = new string[0], PipTips = new string[0];
+    public int[] Pips;
+    public Image Icon;
+}
+
 public class View : Form {
     [StructLayout(LayoutKind.Sequential)]
     struct MEMORYSTATUSEX {
@@ -187,6 +201,11 @@ public class View : Form {
     public readonly HashSet<string> Hidden = new HashSet<string>();
     public event EventHandler Changed;  // the window moved or the view changed
 
+    // Fed by PowerShell from the plugins on their own slower timer.
+    public ExtRow[] ExtRows = new ExtRow[0];
+    public double MarkFrac = -1;        // a tick on the whole-machine bar, 0..1; below 0 draws none
+    public string MarkTip = "", ErrorText = "", ErrorTip = "";
+
     readonly float scale;
     readonly Timer sample = new Timer(), anim = new Timer(), hover = new Timer();
     readonly ToolTip tip = new ToolTip();
@@ -201,7 +220,8 @@ public class View : Form {
     static readonly Color Bg = Color.FromArgb(24, 26, 30), Track = Color.FromArgb(44, 47, 54),
         Grid = Color.FromArgb(60, 64, 72), Text1 = Color.FromArgb(220, 223, 228), Dim = Color.FromArgb(140, 146, 156),
         Low = Color.FromArgb(80, 190, 120), Mid = Color.FromArgb(230, 180, 60), High = Color.FromArgb(230, 80, 70),
-        Ram = Color.FromArgb(110, 160, 230), Disk = Color.FromArgb(180, 140, 230), Net = Color.FromArgb(90, 190, 200);
+        Ram = Color.FromArgb(110, 160, 230), Disk = Color.FromArgb(180, 140, 230), Net = Color.FromArgb(90, 190, 200),
+        Mark = Color.FromArgb(120, 170, 240), Excl = Color.FromArgb(180, 130, 240);
 
     public View(PerformanceCounter[] counters, float scale) {
         this.counters = counters; this.scale = scale;
@@ -431,7 +451,14 @@ public class View : Form {
                 y += BarH;
                 if (cores) {
                     y += 3;
-                    if (g != null) DrawThin(g, track, avg, ok == 0 ? Track : LoadColor(avg), coreX, coreX + innerW, y);
+                    if (g != null) {
+                        DrawThin(g, track, avg, ok == 0 ? Track : LoadColor(avg), coreX, coreX + innerW, y);
+                        if (MarkFrac >= 0) {
+                            double mx = coreX + innerW * Math.Min(1.0, MarkFrac);
+                            using (var markPen = new Pen(Mark, Math.Max(1, Px(1.5))))
+                                g.DrawLine(markPen, Px(mx), Px(y - 2), Px(mx), Px(y + ThinH + 2));
+                        }
+                    }
                     Tip("machine", Px(coreX), Px(y - 3), Px(coreX + innerW), Px(y + ThinH + 3));
                     y += ThinH;
                 }
@@ -468,10 +495,57 @@ public class View : Form {
                 y += RowH + SecGap - 2;
             }
 
+            foreach (var r in ExtRows) {
+                if (!Shown_(r.Key)) continue;
+                any = true;
+                Tip("x:" + r.Key, 0, Px(y - 2), Px(formW), Px(y + RowH));
+                int x0 = Pad + 16;
+                float noteW = 0;
+                if (g != null) {
+                    var ir = new Rectangle(Px(Pad), Px(y + 1), Px(12), Px(12));
+                    if (r.Icon != null) { g.InterpolationMode = InterpolationMode.HighQualityBicubic; g.DrawImage(r.Icon, ir); }
+                    else if (r.Pips != null) DrawSlotGlyph(g, Pad, y + 1);
+                    else using (var b = new SolidBrush(Mark)) g.FillRectangle(b, ir);
+                    if (r.Note.Length > 0) { noteW = g.MeasureString(r.Note, fMain).Width; DrawRight(g, r.Note, brDim, right, y); }
+                }
+                if (r.Pips != null && r.Pips.Length > 0) {
+                    // Pips shrink to fit, so a long row never runs into the note.
+                    int room = formW - Pad - x0 - 34;
+                    int step = Math.Max(3, Math.Min(10, room / r.Pips.Length));
+                    int pip = Math.Max(2, Math.Min(7, step - 2));
+                    if (g != null) g.SmoothingMode = SmoothingMode.AntiAlias;
+                    for (int i = 0; i < r.Pips.Length; i++) {
+                        var pr = new Rectangle(Px(x0 + i * step), Px(y + 3), Px(pip), Px(pip));
+                        Tip("xpip:" + r.Key + ":" + i, Px(x0 + i * step) - Px((step - pip) / 2.0), Px(y), Px(x0 + (i + 1) * step) - Px((step - pip) / 2.0), Px(y + RowH - 2));
+                        if (g == null) continue;
+                        if (r.Pips[i] > 0) using (var b = new SolidBrush(r.Pips[i] == 2 ? Excl : Mark)) g.FillEllipse(b, pr);
+                        else using (var p = new Pen(Grid, Math.Max(1, Px(1)))) g.DrawEllipse(p, pr);
+                    }
+                    if (g != null) g.SmoothingMode = SmoothingMode.None;
+                } else if (g != null && r.Text.Length > 0) {
+                    DrawClipped(g, r.Text, br, x0, y, right - (noteW > 0 ? (int)Math.Ceiling(noteW / scale) + 4 : 0));
+                }
+                y += RowH;
+                foreach (string w in r.Warn) {
+                    Tip("xwarn:" + r.Key, 0, Px(y), Px(formW), Px(y + TextH));
+                    if (g != null) DrawClipped(g, w, brWarn, Pad - 1, y, right);
+                    y += TextH;
+                }
+                y += SecGap - 2;
+            }
+
             if (!any) {
                 if (g != null) g.DrawString("all hidden: right-click", fMain, brDim, Px(Pad - 1), Px(y));
                 Tip("empty", 0, Px(y - 2), Px(formW), Px(y + RowH));
                 y += RowH + SecGap;
+            }
+
+            // A failed plugin refresh is its own red row, never hidden, so stale rows above
+            // it cannot pass for live ones.
+            if (ErrorText.Length > 0) {
+                Tip("error", 0, Px(y - 2), Px(formW), Px(y + TextH));
+                if (g != null) DrawClipped(g, "! " + ErrorText, brWarn, Pad - 1, y, right);
+                y += TextH + SecGap;
             }
         } finally {
             if (g != null) { br.Dispose(); brDim.Dispose(); track.Dispose(); brWarn.Dispose(); hatch.Dispose(); }
@@ -497,6 +571,18 @@ public class View : Form {
     void DrawRight(Graphics g, string s, Brush b, int right, int y) {
         float w = g.MeasureString(s, fMain).Width;
         g.DrawString(s, fMain, b, Px(right + 1) - w, Px(y - 1));
+    }
+
+    // Long text ends in an ellipsis instead of running off the edge.
+    readonly StringFormat clip = new StringFormat(StringFormatFlags.NoWrap) { Trimming = StringTrimming.EllipsisCharacter };
+    void DrawClipped(Graphics g, string s, Brush b, int x, int y, int right) {
+        g.DrawString(s, fMain, b, new RectangleF(Px(x), Px(y), Px(right + 1) - Px(x), Px(TextH + 1)), clip);
+    }
+
+    void DrawSlotGlyph(Graphics g, int x, int y) {
+        // Three stacked lines: the icon for a row of slots without its own icon.
+        using (var b = new SolidBrush(Dim))
+            for (int i = 0; i < 3; i++) g.FillRectangle(b, Px(x), Px(y + 1 + i * 4), Px(12), Math.Max(1, Px(2)));
     }
 
     void DrawThin(Graphics g, Brush track, double pct, Color c, int x, int xEnd, int y, int hUnits = ThinH) {
@@ -527,7 +613,8 @@ public class View : Form {
                     ok < n ? string.Format("\n{0} of {1} core counters failed this sample and are left out (hatched red).", n - ok, n) : "",
                     MoveHint);
             case "machine":
-                return string.Format("Whole machine: {0:0}%\nThe average of every core as one bar.", ok > 0 ? total / ok : 0);
+                return string.Format("Whole machine: {0:0}%\nThe average of every core as one bar.{1}", ok > 0 ? total / ok : 0,
+                    MarkFrac >= 0 && MarkTip.Length > 0 ? "\n" + MarkTip : "");
             case "ram":
                 if (ramFailed) return "RAM: no reading\nThe memory query failed. It tries again next sample.";
                 return string.Format("RAM {0:0}%: {1:0.0} of {2:0.0} GB in use\nPhysical memory. Blue, red from 85%.\n{3}", ramLoad, ramUsedGb, ramTotalGb, MoveHint);
@@ -539,8 +626,25 @@ public class View : Form {
                 return string.Format("Network: {0} down, {1} up\nSum over {2} network adapter{3}. A virtual adapter (VPN, Hyper-V switch) can count the same traffic twice.",
                     Rate(rxBits), Rate(txBits), netAdapters, netAdapters == 1 ? "" : "s");
             case "empty": return "Every section is hidden. Right-click > Show all.";
+            case "error": return ErrorTip;
+        }
+        if (key.StartsWith("x:")) {
+            var r = FindRow(key.Substring(2));
+            return r == null ? "" : r.Tip + (r.Tip.Length > 0 ? "\n" : "") + "Right-click to hide this row.";
+        }
+        if (key.StartsWith("xwarn:")) { var r = FindRow(key.Substring(6)); return r == null ? "" : r.WarnTip; }
+        if (key.StartsWith("xpip:")) {
+            int c = key.LastIndexOf(':');
+            var r = FindRow(key.Substring(5, c - 5));
+            int i = int.Parse(key.Substring(c + 1));
+            return r == null ? "" : i < r.PipTips.Length ? r.PipTips[i] : "";
         }
         return "";
+    }
+
+    ExtRow FindRow(string key) {
+        foreach (var r in ExtRows) if (r.Key == key) return r;
+        return null;
     }
 
     public string[] TipKeys() {
@@ -599,9 +703,13 @@ public class View : Form {
         var sb = new System.Text.StringBuilder();
         foreach (string line in text.Split('\n')) {
             if (sb.Length > 0) sb.Append('\n');
-            int col = 0; bool first = true;
-            foreach (string w in line.Split(' ')) {
-                if (!first && col + 1 + w.Length > width) { sb.Append('\n'); col = 0; }
+            // An indented line (a plugin's list item) keeps its indent when it wraps.
+            int ind = 0; while (ind < line.Length && line[ind] == ' ') ind++;
+            string pad = new string(' ', ind);
+            sb.Append(pad);
+            int col = ind; bool first = true;
+            foreach (string w in line.Substring(ind).Split(' ')) {
+                if (!first && col + 1 + w.Length > width) { sb.Append('\n').Append(pad).Append("  "); col = ind + 2; }
                 else if (!first) { sb.Append(' '); col++; }
                 sb.Append(w); col += w.Length; first = false;
             }
@@ -681,6 +789,105 @@ function Set-Smoothing([string]$Mode) {
 }
 Set-Smoothing ([string]$Cfg.Smoothing)
 
+# ---------------------------------------------------------------- plugins
+
+# A plugin is a .ps1 in %LOCALAPPDATA%\PerformanceWidget\plugins, or a path listed in the
+# Plugins setting. It defines Get-WidgetRows, which returns a hashtable per row; see the
+# README. Each runs in its own module, so its script-scope variables persist between calls
+# and its names cannot collide with the widget's or another plugin's.
+$PluginInterval = 5000
+$Plugins = @()
+$IconCache = @{}
+
+function Get-PluginPaths {
+    $dir = Join-Path $settingsDir 'plugins'
+    $paths = @()
+    if (Test-Path -LiteralPath $dir) { $paths += @(Get-ChildItem -LiteralPath $dir -Filter '*.ps1' -File | Sort-Object Name | ForEach-Object { $_.FullName }) }
+    $paths += @($Cfg.Plugins | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_) })
+    return @($paths | Select-Object -Unique)
+}
+
+function Import-Plugins {
+    $script:Plugins = @()
+    foreach ($path in Get-PluginPaths) {
+        $p = @{ Path = $path; Name = [IO.Path]::GetFileNameWithoutExtension($path); Module = $null; Rows = @(); Error = '' }
+        try {
+            if (-not (Test-Path -LiteralPath $path)) { throw "file not found" }
+            $p.Module = New-Module -Name ("PerformanceWidgetPlugin_" + $p.Name) -ArgumentList $path -ScriptBlock {
+                param($PluginPath)
+                . $PluginPath
+                Export-ModuleMember -Function @()
+            }
+            if (-not (& $p.Module { [bool](Get-Command Get-WidgetRows -CommandType Function -ErrorAction SilentlyContinue) })) { throw 'defines no Get-WidgetRows function' }
+        } catch {
+            $p.Module = $null
+            $p.Error = "load failed: $($_.Exception.Message)"
+        }
+        $script:Plugins += $p
+    }
+}
+
+function Get-RowIcon($Icon) {
+    if ($null -eq $Icon -or $Icon -eq '') { return $null }
+    if ($Icon -is [System.Drawing.Image]) { return $Icon }
+    $path = [string]$Icon
+    if (-not $IconCache.ContainsKey($path)) {
+        $img = $null
+        try {
+            if ($path -match '\.(exe|dll)$') { $img = ([System.Drawing.Icon]::ExtractAssociatedIcon($path)).ToBitmap() }
+            elseif ($path -match '\.ico$') { $img = (New-Object System.Drawing.Icon($path)).ToBitmap() }
+            else { $img = [System.Drawing.Image]::FromFile($path) }
+        } catch { }
+        $IconCache[$path] = $img   # a failed load is cached too, so it is not retried every tick
+    }
+    return $IconCache[$path]
+}
+
+function ConvertTo-ExtRow($h) {
+    $r = New-Object PerformanceWidget.ExtRow
+    $r.Key = [string]$h.Key
+    foreach ($f in @('Text', 'Note', 'Tip', 'WarnTip')) { if ($null -ne $h[$f]) { $r.$f = [string]$h[$f] } }
+    if ($null -ne $h.Warn) { $r.Warn = [string[]]@($h.Warn | ForEach-Object { [string]$_ }) }
+    if ($null -ne $h.PipTips) { $r.PipTips = [string[]]@($h.PipTips | ForEach-Object { [string]$_ }) }
+    if ($null -ne $h.Pips) { $r.Pips = [int[]]@($h.Pips | ForEach-Object { [int]$_ }) }
+    $r.Icon = Get-RowIcon $h.Icon
+    return $r
+}
+
+function Invoke-Plugins {
+    # A plugin that throws keeps its last good rows and puts a red error row under them;
+    # its next good refresh clears it.
+    foreach ($p in $Plugins) {
+        if (-not $p.Module) { continue }
+        try {
+            $p.Rows = @(& $p.Module { Get-WidgetRows } | Where-Object { $_ -is [System.Collections.IDictionary] -and $_.Key })
+            $p.Error = ''
+        } catch {
+            $p.Error = "refresh failed: $($_.Exception.Message)"
+        }
+    }
+    $rows = @(); $labels = [ordered]@{}; $mark = -1.0; $markTip = ''
+    foreach ($p in $Plugins) {
+        foreach ($h in $p.Rows) {
+            $rows += ConvertTo-ExtRow $h
+            $labels[[string]$h.Key] = if ($h.Label) { [string]$h.Label } else { [string]$h.Key }
+            if ($null -ne $h.Mark -and $mark -lt 0) { $mark = [double]$h.Mark; $markTip = [string]$h.MarkTip }
+        }
+    }
+    $form.ExtRows = [PerformanceWidget.ExtRow[]]$rows
+    $form.MarkFrac = $mark; $form.MarkTip = $markTip
+    $script:RowLabels = $labels
+    $bad = @($Plugins | Where-Object { $_.Error })
+    if ($bad) {
+        $form.ErrorText = if ($bad.Count -eq 1) { "$($bad[0].Name): $($bad[0].Error -replace ':.*$', '')" } else { "$($bad.Count) plugins failed" }
+        $form.ErrorTip = (@($bad | ForEach-Object { "$($_.Name): $($_.Error)`n  $($_.Path)" }) + @('Retries every 5 s. Right-click > Reload plugins after fixing a plugin.')) -join "`n"
+    } else { $form.ErrorText = ''; $form.ErrorTip = '' }
+    Update-Anchor
+    $form.Relayout()
+    if (-not $Snapshot) { Set-OnScreen }
+}
+$RowLabels = [ordered]@{}
+
 function Update-Anchor {
     $scr = [System.Windows.Forms.Screen]::FromControl($form).WorkingArea
     $form.GrowUp = ($form.Top + $form.Height / 2) -gt ($scr.Top + $scr.Height / 2)
@@ -755,6 +962,8 @@ foreach ($key in $Sections.Keys) {
 }
 $coreItem = New-Item2 'Per-core bars' { $form.Compact = -not $form.Compact; Update-Layout }
 [void]$menu.Items.Add($coreItem)
+$extItems = @()   # one toggle per plugin row, rebuilt each time the menu opens
+$reloadItem = New-Item2 'Reload plugins' { Import-Plugins; Invoke-Plugins }
 [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
 $ivMenu = New-Item2 'Update interval' $null
@@ -787,6 +996,7 @@ $startItem = New-Item2 'Start with Windows' {
 [void]$menu.Items.Add($startItem)
 $resetItem = New-Item2 'Reset position' { Reset-Position; Update-Anchor; Save-Window }
 [void]$menu.Items.Add($resetItem)
+[void]$menu.Items.Add($reloadItem)
 [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 $aboutItem = New-Item2 "About $AppName" {
     $r = [System.Windows.Forms.MessageBox]::Show(
@@ -798,6 +1008,21 @@ $aboutItem = New-Item2 "About $AppName" {
 [void]$menu.Items.Add((New-Item2 'Exit' { $form.Close() }))
 $menu.add_Opening({
     # Ticks reflect the current state each time the menu opens.
+    foreach ($it in $script:extItems) { $menu.Items.Remove($it) }
+    $script:extItems = @()
+    $at = $menu.Items.IndexOf($coreItem)
+    foreach ($key in $RowLabels.Keys) {
+        $it = New-Item2 $RowLabels[$key] {
+            param($s, $e)
+            if ($form.Hidden.Contains($s.Tag)) { [void]$form.Hidden.Remove($s.Tag) } else { [void]$form.Hidden.Add($s.Tag) }
+            Update-Layout
+        }
+        $it.Tag = $key
+        $it.Checked = -not $form.Hidden.Contains($key)
+        $menu.Items.Insert($at, $it); $at++
+        $script:extItems += $it
+    }
+    $reloadItem.Visible = $Plugins.Count -gt 0 -or (Get-PluginPaths).Count -gt 0
     foreach ($key in $secItems.Keys) { $secItems[$key].Checked = -not $form.Hidden.Contains($key) }
     $coreItem.Checked = -not $form.Compact
     foreach ($it in $ivMenu.DropDownItems) { $it.Checked = ([int]$it.Tag -eq $form.Interval) }
@@ -813,6 +1038,11 @@ $form.add_Changed({ Update-Anchor; if (-not $Snapshot) { Set-OnScreen }; Save-Wi
 
 # ---------------------------------------------------------------- start
 
+Import-Plugins
+$pluginTimer = New-Object System.Windows.Forms.Timer
+$pluginTimer.Interval = $PluginInterval
+$pluginTimer.add_Tick({ Invoke-Plugins })
+if ($Plugins) { Invoke-Plugins }
 $form.Relayout()
 
 # Restore the saved spot if it is still on a screen. Monitors left of or above the
@@ -840,6 +1070,8 @@ if ($Snapshot) {
     $form.Show()
     for ($k = 0; $k -lt 3; $k++) { Start-Sleep -Milliseconds 1000; $form.SampleNow() }
     $form.Settle()
+    if ($Plugins) { Invoke-Plugins }   # a second pass, so a plugin that measures rates has two readings
+    $form.GrowUp = $false; $form.GrowLeft = $false
     $form.Relayout()
     [System.Windows.Forms.Application]::DoEvents()
     $bmp = New-Object System.Drawing.Bitmap($form.Width, $form.Height)
@@ -848,7 +1080,7 @@ if ($Snapshot) {
     $bmp.Dispose()
     Write-Output ("snapshot {0}x{1} -> {2}" -f $form.Width, $form.Height, $Snapshot)
     # One parseable line for the tests.
-    Write-Output ("state hidden={0} opacity={1} topmost={2} interval={3} compact={4} locked={5} smoothing={6} failed={7} ramfailed={8} diskfailed={9} netfailed={10} width={11} height={12}" -f (@($form.Hidden) -join ','), $form.Opacity, $form.TopMost, $form.Interval, $form.Compact, $form.Locked, $Cfg.Smoothing, $form.FailedCores(), $form.RamFailed, $form.DiskFailed, $form.NetFailed, $form.Width, $form.Height)
+    Write-Output ("state hidden={0} opacity={1} topmost={2} interval={3} compact={4} locked={5} smoothing={6} failed={7} ramfailed={8} diskfailed={9} netfailed={10} width={11} height={12} plugins={13} rows={14} mark={15} error={16}" -f (@($form.Hidden) -join ','), $form.Opacity, $form.TopMost, $form.Interval, $form.Compact, $form.Locked, $Cfg.Smoothing, $form.FailedCores(), $form.RamFailed, $form.DiskFailed, $form.NetFailed, $form.Width, $form.Height, $Plugins.Count, (@($form.ExtRows | ForEach-Object { $_.Key }) -join ','), $form.MarkFrac, ($form.ErrorText -replace ' ', '_'))
     # Every hover region and its text, one line each.
     foreach ($k in $form.TipKeys()) { Write-Output ("tip {0}: {1}" -f $k, ($form.TipFor($k) -replace "`n", ' | ')) }
     $form.Close()
@@ -857,5 +1089,6 @@ if ($Snapshot) {
 
 Update-Anchor
 $form.StartSampling()
-$form.add_FormClosed({ Save-Window; try { $mutex.ReleaseMutex() } catch { } })
+$pluginTimer.Start()   # always runs, so a plugin added later shows up after Reload plugins
+$form.add_FormClosed({ $pluginTimer.Stop(); Save-Window; try { $mutex.ReleaseMutex() } catch { } })
 [System.Windows.Forms.Application]::Run($form)

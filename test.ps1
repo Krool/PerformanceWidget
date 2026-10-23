@@ -22,9 +22,14 @@ function Assert([bool]$Cond, [string]$Name, [string]$Detail = '') {
     else { Write-Output "  FAIL $Name $Detail"; $script:failures++ }
 }
 
-function Invoke-Widget([string]$Case, $Settings = $null, [switch]$ShowAll, [string]$Fail = '') {
+function Invoke-Widget([string]$Case, $Settings = $null, [switch]$ShowAll, [string]$Fail = '', [hashtable]$Plugins = @{}) {
     $app = Join-Path $root "$Case-appdata"
     New-Item -ItemType Directory -Force -Path (Join-Path $app 'PerformanceWidget') | Out-Null
+    if ($Plugins.Count) {
+        $pd = Join-Path $app 'PerformanceWidget\plugins'
+        New-Item -ItemType Directory -Force -Path $pd | Out-Null
+        foreach ($k in $Plugins.Keys) { Set-Content -LiteralPath (Join-Path $pd "$k.ps1") -Value $Plugins[$k] -Encoding UTF8 }
+    }
     $cfgPath = Join-Path $app 'PerformanceWidget\settings.json'
     if ($null -ne $Settings) { Set-Content -LiteralPath $cfgPath -Value $Settings -Encoding UTF8 }
     $png = Join-Path $root "$Case.png"
@@ -93,6 +98,36 @@ try {
     $r = Invoke-Widget 'empty' -Settings '{ "Hidden": ["cpu", "ram", "disk", "net"] }'
     Assert ($r.Code -eq 0) 'exits 0' "code=$($r.Code)"
     Assert ($r.Tips.ContainsKey('empty')) 'says how to bring sections back' ("keys: " + ($r.Tips.Keys -join ','))
+
+    Write-Output 'case: plugins'
+    $good = @'
+$Calls = 0
+function Get-WidgetRows {
+    $script:Calls++
+    @{ Key = 'jobs'; Label = 'Jobs'; Pips = @(1, 2, 0); PipTips = @('slot 0 busy', 'slot 1 exclusive', 'slot 2 free'); Note = '2/3'; Tip = 'Job slots'; Mark = 0.25; MarkTip = 'tick here' }
+    @{ Key = 'svc'; Text = "calls $Calls"; Warn = @('! stalled'); WarnTip = 'Something stalled' }
+}
+'@
+    $r = Invoke-Widget 'plugins' -Plugins @{ good = $good }
+    Assert ($r.Code -eq 0) 'exits 0' "code=$($r.Code)`n$($r.Text)"
+    Assert ($r.State.plugins -eq '1' -and $r.State.rows -eq 'jobs,svc') 'loads the plugin rows' "plugins=$($r.State.plugins) rows=$($r.State.rows)"
+    Assert ($r.State.mark -eq '0.25') 'a row can put a tick on the machine bar' "got '$($r.State.mark)'"
+    Assert ($r.Tips['machine'] -match 'tick here') 'machine hover adds the tick text'
+    Assert ($r.Tips['xpip:jobs:1'] -eq 'slot 1 exclusive') 'each pip has its own hover text' "got '$($r.Tips['xpip:jobs:1'])'"
+    Assert ($r.Tips['x:jobs'] -match '^Job slots \| Right-click to hide') 'row hover text' "got '$($r.Tips['x:jobs'])'"
+    Assert ($r.Tips['xwarn:svc'] -eq 'Something stalled') 'warning lines have hover text'
+    Assert ($r.State.error -eq '') 'no error row' "got '$($r.State.error)'"
+    if ($perCore -and $r.Size) { Assert ($r.Size.Height -gt $perCore.Height) 'plugin rows add height' }
+    $r = Invoke-Widget 'plugin-hidden' -Plugins @{ good = $good } -Settings '{ "Hidden": ["disk", "net", "jobs"] }'
+    Assert (-not $r.Tips.ContainsKey('x:jobs') -and $r.Tips.ContainsKey('x:svc')) 'a plugin row hides like a section' ("keys: " + ($r.Tips.Keys -join ','))
+
+    $r = Invoke-Widget 'plugin-broken' -Plugins @{ a = $good; b = 'function Get-WidgetRows { throw "boom" }'; c = '$x = 1' }
+    Assert ($r.Code -eq 0) 'a broken plugin does not stop the widget' "code=$($r.Code)`n$($r.Text)"
+    Assert ($r.State.rows -eq 'jobs,svc') 'the working plugin still draws' "got '$($r.State.rows)'"
+    Assert ($r.State.error -eq '2_plugins_failed') 'red error row counts the failures' "got '$($r.State.error)'"
+    Assert ($r.Tips['error'] -match 'b: refresh failed: boom' -and $r.Tips['error'] -match 'c: load failed: defines no Get-WidgetRows') 'error hover names each plugin and why' "got '$($r.Tips['error'])'"
+    $r = Invoke-Widget 'plugin-missing' -Settings '{ "Plugins": ["C:\\nowhere\\gone.ps1"] }'
+    Assert ($r.Code -eq 0 -and $r.State.error -eq 'gone:_load_failed') 'a missing plugin path shows an error row' "got '$($r.State.error)'"
 
     Write-Output 'case: settings robustness'
     $r = Invoke-Widget 'corrupt' -Settings '{ this is not json'
