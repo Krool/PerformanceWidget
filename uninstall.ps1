@@ -4,7 +4,8 @@
   the %LOCALAPPDATA%\PerformanceWidget folder.
 
 .PARAMETER KeepSettings
-  Keep settings.json (position and options), so a later install picks up where you left off.
+  Keep settings.json (position and options) and the plugins folder (scripts you wrote), so a
+  later install picks up where you left off.
 #>
 param([switch]$KeepSettings)
 
@@ -28,8 +29,9 @@ Push-Location ([System.IO.Path]::GetTempPath())
 try {
     if (Test-Path -LiteralPath $dataDir) {
         if ($KeepSettings) {
-            Get-ChildItem -LiteralPath $dataDir | Where-Object { $_.Name -ne 'settings.json' } | Remove-Item -Recurse -Force
-            Write-Output "Removed the app; kept $(Join-Path $dataDir 'settings.json')"
+            # plugins\ holds scripts the user wrote; "keep my settings" must not delete them.
+            Get-ChildItem -LiteralPath $dataDir | Where-Object { $_.Name -notin @('settings.json', 'plugins') } | Remove-Item -Recurse -Force
+            Write-Output "Removed the app; kept settings.json and plugins in $dataDir"
         } else {
             Remove-Item -LiteralPath $dataDir -Recurse -Force
             Write-Output "Removed $dataDir"

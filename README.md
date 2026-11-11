@@ -154,7 +154,7 @@ powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\PerformanceWidget\ap
 ```
 
 This closes the widget, removes the Start Menu and Startup shortcuts, and deletes
-`%LOCALAPPDATA%\PerformanceWidget`. Add `-KeepSettings` to keep your position and options.
+`%LOCALAPPDATA%\PerformanceWidget`. Add `-KeepSettings` to keep your position, options and the `plugins` folder; without it your plugin scripts are deleted too.
 
 ## How it works
 
