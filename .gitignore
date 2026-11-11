@@ -1,1 +1,4 @@
 *.zip
+
+# local agent state
+.claude/
